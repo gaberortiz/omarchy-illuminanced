@@ -112,15 +112,25 @@ Panel {
     function toggleAutoBrightness() { setAutoBrightness(!root.autoBrightnessEnabled) }
 
     // The daemon already polls the sensor and the service every second. It
-    // publishes what it found, so the widget watches one file instead of
-    // spawning its own brightnessctl/systemctl/sensor probes in a loop.
-    FileView {
-        id: statusFile
-        path: Quickshell.env("XDG_RUNTIME_DIR") + "/user-autobright-status.json"
-        watchChanges: true
-        blockLoading: true
-        onFileChanged: root.applyStatus(statusFile.text())
-        onLoaded: root.applyStatus(statusFile.text())
+    // publishes what it found, so the widget reads one small file instead of
+    // spawning its own brightnessctl, systemctl and sensor probes. Quickshell's
+    // FileView does not follow this file on change here, and re-reading it
+    // returns cached text, so this is a bare cat of ~90 bytes rather than a
+    // shell pipeline: one tiny process every couple of seconds.
+    Process {
+        id: statusProc
+        command: ["cat", Quickshell.env("XDG_RUNTIME_DIR") + "/user-autobright-status.json"]
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: root.applyStatus(text)
+        }
+    }
+
+    Timer {
+        interval: 2000
+        repeat: true
+        running: true
+        onTriggered: if (!statusProc.running) statusProc.running = true
     }
 
     function applyStatus(raw) {

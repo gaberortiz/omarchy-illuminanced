@@ -18,6 +18,7 @@ from pathlib import Path
 DEFAULTS = {
     "dark": 10,
     "light": 100,
+    "gamma": 1.0,
     "min_brightness": 5,
     "max_brightness": 100,
     "interval": 2,
@@ -50,6 +51,7 @@ def load_config():
     light = config.getint("thresholds", "light", fallback=DEFAULTS["light"])
     min_bri = config.getint("brightness", "min", fallback=DEFAULTS["min_brightness"])
     max_bri = config.getint("brightness", "max", fallback=DEFAULTS["max_brightness"])
+    gamma = config.getfloat("brightness", "gamma", fallback=DEFAULTS["gamma"])
     interval = config.getint("polling", "interval", fallback=DEFAULTS["interval"])
     debounce = config.getint("polling", "debounce", fallback=DEFAULTS["debounce"])
     sensor = config.get("sensor", "device", fallback=DEFAULTS["sensor"]).strip()
@@ -75,7 +77,11 @@ def load_config():
         logging.error("Invalid config: debounce (%d) must be at least 1", debounce)
         sys.exit(1)
 
-    return dark, light, min_bri, max_bri, interval, debounce, sensor, backlight_device
+    if not 0.05 <= gamma <= 5.0:
+        logging.error("Invalid config: gamma (%s) must be between 0.05 and 5.0", gamma)
+        return None
+
+    return dark, light, min_bri, max_bri, gamma, interval, debounce, sensor, backlight_device
 
 
 def find_sensor(device_override):
@@ -172,14 +178,19 @@ def write_status(brightness_percent, sensor_raw, state, service_running):
         logging.debug("Could not write status file: %s", e)
 
 
-def interpolate_brightness(raw, dark, light, min_bri, max_bri):
+def interpolate_brightness(raw, dark, light, min_bri, max_bri, gamma=1.0):
     if raw <= dark:
         return min_bri
-    elif raw >= light:
+    if raw >= light:
         return max_bri
-    else:
-        ratio = (raw - dark) / (light - dark)
-        return round(min_bri + ratio * (max_bri - min_bri))
+    ratio = (raw - dark) / (light - dark)
+    if gamma != 1.0:
+        # ALS counts rise roughly logarithmically, so a straight line buries
+        # ordinary indoor light near the bottom of the range. A gamma below 1
+        # bends the curve up to spend more of the scale where people actually
+        # are: 1.0 is linear, 0.5 is roughly perceptual.
+        ratio = ratio ** gamma
+    return round(min_bri + ratio * (max_bri - min_bri))
 
 
 def main():
@@ -193,7 +204,7 @@ def main():
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    dark, light, min_bri, max_bri, interval, debounce, sensor_override, backlight_device = load_config()
+    dark, light, min_bri, max_bri, gamma, interval, debounce, sensor_override, backlight_device = load_config()
     sensor_path = find_sensor(sensor_override)
 
     max_raw_brightness = get_max_brightness(backlight_device)
@@ -202,8 +213,8 @@ def main():
         sys.exit(1)
 
     logging.info(
-        "Starting: dark=%d, light=%d, brightness=%d%%-%d%%, poll=%ds, debounce=%d, device=%s",
-        dark, light, min_bri, max_bri, interval, debounce, backlight_device,
+        "Starting: dark=%d, light=%d, brightness=%d%%-%d%%, gamma=%.2f, poll=%ds, debounce=%d, device=%s",
+        dark, light, min_bri, max_bri, gamma, interval, debounce, backlight_device,
     )
 
     state = "auto"
@@ -285,7 +296,7 @@ def main():
                 last_written = None
                 pending_target = None
 
-        target_percent = interpolate_brightness(raw, dark, light, min_bri, max_bri)
+        target_percent = interpolate_brightness(raw, dark, light, min_bri, max_bri, gamma)
 
         if state == "auto":
             actual = get_current_brightness(backlight_device)

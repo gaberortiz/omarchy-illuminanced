@@ -50,13 +50,33 @@ did not make, so the toggle always reflects what is actually happening.
 
 ### Calibration
 
-`[thresholds] dark` and `light` are raw sensor counts, and the mapping is
-monotonic: `dark` or below maps to `[brightness] min`, `light` or above maps to
-`max`. Watch the raw value and set the thresholds to match your room:
+`[thresholds] dark` and `light` are raw sensor counts. The mapping is monotonic:
+`dark` or below gives `[brightness] min`, `light` or above gives `max`, and
+`gamma` bends the curve in between.
+
+This machine's ALS was measured as:
+
+| Condition | Raw |
+| --- | --- |
+| dark room | 1–2 |
+| normal room light | 15 |
+| flashlight | 47–48 |
+
+That is a narrow, strongly non-linear range, so the shipped values are
+`dark = 3`, `light = 48`, `gamma = 0.5` — with a straight line, ordinary indoor
+light at raw 15 lands near 29% and the top half of the brightness range is
+unreachable. With the gamma curve, normal room light gives 54% and a flashlight
+reaches 100%.
+
+Re-measure for your own room before trusting these:
 
 ```sh
 watch -n1 cat /sys/bus/iio/devices/iio:device0/in_illuminance_raw
 ```
+
+`gamma` below 1 lifts the mid-range, above 1 pushes it down. If normal room
+light feels too dim, lower gamma toward 0.4; if it is too bright, raise it
+toward 0.7.
 
 ## Troubleshooting
 
