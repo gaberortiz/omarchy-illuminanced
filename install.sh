@@ -12,12 +12,15 @@ mkdir -p "$plugin_dir" "$conf_dir" "$bin_dir"
 
 install -m644 "$src/plugin/illuminanced/manifest.json" "$plugin_dir/manifest.json"
 install -m644 "$src/plugin/illuminanced/Panel.qml" "$plugin_dir/Panel.qml"
-install -m644 "$src/user-autobright.conf" "$conf_dir/user-autobright.conf"
 install -m755 "$src/user-autobright.py" "$bin_dir/user-autobright.py"
 
-# Keep an existing calibration rather than resetting it to the defaults.
-if [ -f "$conf_dir/user-autobright.conf" ] && [ "$conf_dir/user-autobright.conf" != "$src/user-autobright.conf" ]; then
+# Thresholds are per-machine, so an existing calibration is kept. The shipped
+# conf only fills in a machine that has none yet.
+if [ -f "$conf_dir/user-autobright.conf" ]; then
   echo "Kept existing $conf_dir/user-autobright.conf"
+else
+  install -m644 "$src/user-autobright.conf" "$conf_dir/user-autobright.conf"
+  echo "Installed default $conf_dir/user-autobright.conf"
 fi
 
 echo "Installed plugin to $plugin_dir"
