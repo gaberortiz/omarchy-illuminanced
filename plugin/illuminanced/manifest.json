@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "user.illuminanced",
+  "name": "Auto Brightness",
+  "version": "1.0.0",
+  "author": "User",
+  "description": "Ambient light sensor auto-brightness control",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Auto Brightness",
+    "description": "Ambient light sensor auto-brightness control",
+    "category": "System",
+    "allowMultiple": false
+  }
+}
