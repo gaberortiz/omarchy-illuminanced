@@ -109,16 +109,20 @@ def set_brightness(device, percent):
 
 
 def get_current_brightness(device):
+    # sysfs first. brightnessctl is a D-Bus wrapper around this same file, and
+    # this runs on every poll, so shelling out to it cost a process per second
+    # to read four digits. brightnessctl stays as the fallback.
+    try:
+        return int(Path(f"/sys/class/backlight/{device}/brightness").read_text().strip())
+    except (OSError, ValueError):
+        pass
     try:
         result = subprocess.run(["brightnessctl", "-d", device, "get"], capture_output=True, text=True, timeout=5)
         if result.returncode == 0:
             return int(result.stdout.strip())
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError):
         pass
-    try:
-        return int(Path(f"/sys/class/backlight/{device}/brightness").read_text().strip())
-    except (OSError, ValueError):
-        return None
+    return None
 
 
 def get_max_brightness(device):
@@ -141,9 +145,16 @@ def status_path():
     return Path(runtime) / "user-autobright-status.json"
 
 
+_last_status = None
+
+
 def write_status(brightness_percent, sensor_raw, state, service_running):
     # The bar widget reads this instead of spawning its own sensor/service
     # probes, so the two never disagree and the panel costs no processes.
+    # Rewriting an identical file every second would wake the widget's inotify
+    # watch and make it re-parse JSON for nothing, so only a real change is
+    # published.
+    global _last_status
     payload = {
         "brightness": brightness_percent,
         "sensor": sensor_raw,
@@ -151,8 +162,12 @@ def write_status(brightness_percent, sensor_raw, state, service_running):
         "serviceRunning": service_running,
         "updated": time.time(),
     }
+    comparable = {k: payload[k] for k in ("brightness", "sensor", "auto", "serviceRunning")}
+    if comparable == _last_status:
+        return
     try:
         status_path().write_text(json.dumps(payload))
+        _last_status = comparable
     except OSError as e:
         logging.debug("Could not write status file: %s", e)
 
