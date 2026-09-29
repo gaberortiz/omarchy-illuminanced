@@ -23,6 +23,7 @@ DEFAULTS = {
     "max_brightness": 100,
     "interval": 2,
     "debounce": 3,
+    "slew": 3,
     "sensor": "",
     "backlight_device": "amdgpu_bl1",
 }
@@ -54,6 +55,7 @@ def load_config():
     gamma = config.getfloat("brightness", "gamma", fallback=DEFAULTS["gamma"])
     interval = config.getint("polling", "interval", fallback=DEFAULTS["interval"])
     debounce = config.getint("polling", "debounce", fallback=DEFAULTS["debounce"])
+    slew = config.getint("polling", "slew", fallback=DEFAULTS["slew"])
     sensor = config.get("sensor", "device", fallback=DEFAULTS["sensor"]).strip()
     backlight_device = config.get("backlight", "device", fallback=DEFAULTS["backlight_device"]).strip()
 
@@ -81,7 +83,11 @@ def load_config():
         logging.error("Invalid config: gamma (%s) must be between 0.05 and 5.0", gamma)
         return None
 
-    return dark, light, min_bri, max_bri, gamma, interval, debounce, sensor, backlight_device
+    if slew < 1:
+        logging.error("Invalid config: slew (%d) must be at least 1", slew)
+        return None
+
+    return dark, light, min_bri, max_bri, gamma, interval, debounce, slew, sensor, backlight_device
 
 
 def find_sensor(device_override):
@@ -155,14 +161,16 @@ _last_status = None
 # The panel's curve editor seeds its sliders from here, so the widget and the
 # daemon can never disagree about the active calibration.
 _curve = {"dark": 0, "light": 0, "gamma": 1.0, "min": 0, "max": 100}
+_slew = 0
 
 
-def publish_curve(dark, light, min_bri, max_bri, gamma):
+def publish_curve(dark, light, min_bri, max_bri, gamma, slew=0):
     _curve["dark"] = dark
     _curve["light"] = light
     _curve["min"] = min_bri
     _curve["max"] = max_bri
     _curve["gamma"] = gamma
+    globals()["_slew"] = slew
 
 
 def write_status(brightness_percent, sensor_raw, state, service_running):
@@ -178,9 +186,10 @@ def write_status(brightness_percent, sensor_raw, state, service_running):
         "auto": state == "auto",
         "serviceRunning": service_running,
         "curve": dict(_curve),
+        "slew": _slew,
         "updated": time.time(),
     }
-    comparable = {k: payload[k] for k in ("brightness", "sensor", "auto", "serviceRunning", "curve")}
+    comparable = {k: payload[k] for k in ("brightness", "sensor", "auto", "serviceRunning", "curve", "slew")}
     if comparable == _last_status:
         return
     try:
@@ -205,6 +214,16 @@ def interpolate_brightness(raw, dark, light, min_bri, max_bri, gamma=1.0):
     return round(min_bri + ratio * (max_bri - min_bri))
 
 
+def slew_toward(current, target, slew):
+    """One bounded step from current toward target.
+
+    Split out from the poll loop so the easing is a testable rule rather than
+    arithmetic buried in a branch. Overshooting is impossible by construction:
+    the step is clamped to the remaining distance.
+    """
+    return current + max(-slew, min(slew, target - current))
+
+
 def set_config_values(assignments):
     """Update named config values in place and validate the result.
 
@@ -220,6 +239,7 @@ def set_config_values(assignments):
         "gamma": ("brightness", "gamma", float),
         "interval": ("polling", "interval", int),
         "debounce": ("polling", "debounce", int),
+        "slew": ("polling", "slew", int),
     }
 
     config = configparser.ConfigParser()
@@ -252,6 +272,7 @@ def set_config_values(assignments):
         "gamma": config.getfloat("brightness", "gamma", fallback=DEFAULTS["gamma"]),
         "interval": config.getint("polling", "interval", fallback=DEFAULTS["interval"]),
         "debounce": config.getint("polling", "debounce", fallback=DEFAULTS["debounce"]),
+        "slew": config.getint("polling", "slew", fallback=DEFAULTS["slew"]),
     }
     if effective["dark"] >= effective["light"]:
         return f"error: dark ({effective['dark']}) must be less than light ({effective['light']})"
@@ -261,6 +282,8 @@ def set_config_values(assignments):
         return f"error: gamma ({effective['gamma']}) must be between 0.05 and 5.0"
     if effective["interval"] < 1:
         return "error: interval must be at least 1"
+    if effective["slew"] < 1:
+        return "error: slew must be at least 1"
 
     tmp = CONFIG_PATH + ".tmp"
     try:
@@ -283,7 +306,7 @@ def main():
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    dark, light, min_bri, max_bri, gamma, interval, debounce, sensor_override, backlight_device = load_config()
+    dark, light, min_bri, max_bri, gamma, interval, debounce, slew, sensor_override, backlight_device = load_config()
     sensor_path = find_sensor(sensor_override)
 
     max_raw_brightness = get_max_brightness(backlight_device)
@@ -292,8 +315,8 @@ def main():
         sys.exit(1)
 
     logging.info(
-        "Starting: dark=%d, light=%d, brightness=%d%%-%d%%, gamma=%.2f, poll=%ds, debounce=%d, device=%s",
-        dark, light, min_bri, max_bri, gamma, interval, debounce, backlight_device,
+        "Starting: dark=%d, light=%d, brightness=%d%%-%d%%, gamma=%.2f, poll=%ds, debounce=%d, slew=%d%%/poll, device=%s",
+        dark, light, min_bri, max_bri, gamma, interval, debounce, slew, backlight_device,
     )
 
     state = "auto"
@@ -305,6 +328,9 @@ def main():
     sensor_dead_reads = max(3, int(round(10 / max(interval, 1))))
     noise_floor = 2
     pending_target = None
+    # Settled target, kept apart from last_written so the slew rate below can
+    # be independent of how long the debounce takes to confirm a reading.
+    desired = None
     change_threshold = 3
     last_raw = 0
 
@@ -312,7 +338,7 @@ def main():
         # The panel edits this file from the GUI, so pick changes up within one
         # poll rather than needing a service restart. A rejected config leaves
         # the running one in place rather than taking the daemon down.
-        nonlocal dark, light, min_bri, max_bri, gamma, interval, debounce
+        nonlocal dark, light, min_bri, max_bri, gamma, interval, debounce, slew
         nonlocal sensor_override, backlight_device
         try:
             stamp = os.path.getmtime(CONFIG_PATH)
@@ -325,10 +351,10 @@ def main():
         if values is None:
             logging.error("Config rejected, keeping previous settings")
             return False
-        if reload_config.values is not None and values[:7] == reload_config.values[:7]:
+        if reload_config.values is not None and values[:8] == reload_config.values[:8]:
             return False
         logging.info("Config changed, applying without restart")
-        (dark, light, min_bri, max_bri, gamma, interval, debounce,
+        (dark, light, min_bri, max_bri, gamma, interval, debounce, slew,
          sensor_override, backlight_device) = values
         reload_config.values = values
         return True
@@ -354,7 +380,7 @@ def main():
 
     while running:
         reload_config()
-        publish_curve(dark, light, min_bri, max_bri, gamma)
+        publish_curve(dark, light, min_bri, max_bri, gamma, slew)
 
         # Check if manual override is active
         if manual_override_file.exists():
@@ -370,6 +396,7 @@ def main():
             counter = 0
             last_written = None
             pending_target = None
+            desired = None
 
         raw = read_sensor(sensor_path)
         if raw is None:
@@ -409,6 +436,7 @@ def main():
                 counter = 0
                 last_written = None
                 pending_target = None
+                desired = None
 
         target_percent = interpolate_brightness(raw, dark, light, min_bri, max_bri, gamma)
 
@@ -427,14 +455,16 @@ def main():
                     except OSError:
                         pass
                     counter = 0
+                    last_written = None
                     pending_target = None
+                    desired = None
                     continue
 
             # Debounce the target, not the sensor position. Gating the write
             # on raw <= dark or raw >= light meant a reading anywhere in the
             # middle of the range reset the counter and never moved the
             # backlight, so the panel only ever tracked the two endpoints.
-            if last_written is not None and abs(target_percent - last_written) < change_threshold:
+            if desired is not None and abs(target_percent - desired) < change_threshold:
                 pending_target = None
                 counter = 0
             elif pending_target == target_percent:
@@ -444,10 +474,25 @@ def main():
                 counter = 1
 
             if counter >= debounce:
-                if target_percent != last_written:
-                    set_brightness(backlight_device, target_percent)
-                    last_written = target_percent
-                    logging.info("Auto brightness %d%% (raw=%d)", target_percent, raw)
+                desired = target_percent
+                pending_target = None
+                counter = 0
+
+            # Ease toward the settled target rather than jumping to it. A small
+            # change in raw counts can move the target by tens of percent, and
+            # writing that in one step is what makes auto-brightness feel
+            # abrupt. slew caps how far the backlight may travel per poll, so
+            # the change is spread over time instead.
+            if last_written is None:
+                # First poll after enabling: adopt what the backlight is
+                # already doing as the starting point for the ramp.
+                last_written = actual_percent
+
+            if desired is not None and last_written != desired:
+                new_percent = slew_toward(last_written, desired, slew)
+                set_brightness(backlight_device, new_percent)
+                last_written = new_percent
+                logging.info("Auto brightness %d%% (raw=%d)", new_percent, raw)
                 pending_target = None
                 counter = 0
 

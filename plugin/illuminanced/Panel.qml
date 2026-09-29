@@ -27,6 +27,7 @@ Panel {
     property real curveGamma: 0.5
     property int curveMin: 5
     property int curveMax: 100
+    property int curveSlew: 3
     property string curveSaveMsg: ""
     property bool curveOpen: false
     readonly property string daemonPath: Quickshell.env("HOME") + "/.local/bin/user-autobright.py"
@@ -83,7 +84,7 @@ Panel {
         return "auto " + (root.autoBrightnessEnabled ? "on" : "off")
     }
     function stateIpc() {
-        return JSON.stringify({ brightness: root.brightnessPercent, autoBrightness: root.autoBrightnessEnabled, sensor: root.sensorValue, serviceRunning: root.serviceRunning, w: root.implicitWidth, h: root.implicitHeight, inBar: root.bar !== null && root.bar !== undefined, slotW: root.parent ? Math.round(root.parent.width) : -1, slotH: root.parent ? Math.round(root.parent.height) : -1, curve: { dark: root.curveDark, light: root.curveLight, gamma: root.curveGamma, min: root.curveMin, max: root.curveMax }, curveOpen: root.curveOpen, sensorMapped: root.curvePercent(root.sensorValue) })
+        return JSON.stringify({ brightness: root.brightnessPercent, autoBrightness: root.autoBrightnessEnabled, sensor: root.sensorValue, serviceRunning: root.serviceRunning, w: root.implicitWidth, h: root.implicitHeight, inBar: root.bar !== null && root.bar !== undefined, slotW: root.parent ? Math.round(root.parent.width) : -1, slotH: root.parent ? Math.round(root.parent.height) : -1, curve: { dark: root.curveDark, light: root.curveLight, gamma: root.curveGamma, min: root.curveMin, max: root.curveMax }, slew: root.curveSlew, curveOpen: root.curveOpen, sensorMapped: root.curvePercent(root.sensorValue) })
     }
 
     IpcHandler {
@@ -162,6 +163,9 @@ Panel {
             root.curveMin = s.curve.min
             root.curveMax = s.curve.max
         }
+        if (typeof s.slew === "number") {
+            root.curveSlew = s.slew
+        }
     }
 
     // Applied live while dragging so the plot tracks the slider, then written
@@ -170,21 +174,25 @@ Panel {
         if (key === "dark") root.curveDark = Math.round(value)
         else if (key === "light") root.curveLight = Math.round(value)
         else if (key === "gamma") root.curveGamma = Math.round(value * 100) / 100
+        else if (key === "slew") root.curveSlew = Math.round(value)
     }
 
     // The daemon reads its config once at startup and used to need a restart to
     // see an edit, so writes go through its own --set mode. It validates the
     // whole file and refuses an unusable curve, which is why the panel never
     // has to reason about whether dark < light before sending.
-    function writeCurve(key, value) {
-        curveProc.command = ["bash", "-c", root.daemonPath + " --set " + key + "=" + value + " 2>&1"]
-        curveProc.running = true
-    }
-
+    // All four values go out in one call. Reassigning curveProc.command per key
+    // meant only the last write survived, and a drag that crossed two sliders
+    // could persist a half-updated curve; --set validates the whole set before
+    // replacing the file, so one command is also one atomic write.
     function saveCurve() {
-        writeCurve("dark", root.curveDark)
-        writeCurve("light", root.curveLight)
-        writeCurve("gamma", root.curveGamma)
+        var args = " --set"
+            + " dark=" + root.curveDark
+            + " light=" + root.curveLight
+            + " gamma=" + root.curveGamma
+            + " slew=" + root.curveSlew
+        curveProc.command = ["bash", "-c", root.daemonPath + args + " 2>&1"]
+        curveProc.running = true
     }
 
     // Same mapping as the daemon's interpolate_brightness, so the preview is
@@ -213,7 +221,13 @@ Panel {
 
     Process { id: curveProc
         stdout: StdioCollector { waitForEnd: true }
-        onExited: { root.curveSaveMsg = "Saved"; curveMsgTimer.restart() }
+        // The daemon refuses edits that would leave an unusable curve, so
+        // reporting "Saved" purely on exit would lie whenever that happened.
+        onExited: (code) => {
+            var out = (stdout.text || "").trim()
+            root.curveSaveMsg = code === 0 ? "Saved" : (out.split("\n").pop() || "Rejected")
+            curveMsgTimer.restart()
+        }
     }
 
     Timer { id: curveMsgTimer; interval: 1600; onTriggered: root.curveSaveMsg = "" }
@@ -497,7 +511,8 @@ PanelSectionHeader {
                         model: [
                             { label: "DARK", key: "dark", from: 0, to: Math.max(1, root.curveLight - 1), step: 1 },
                             { label: "LIGHT", key: "light", from: Math.min(root.curveLight + 1, 999), to: 999, step: 1 },
-                            { label: "GAMMA", key: "gamma", from: 0.1, to: 3.0, step: 0.05 }
+                            { label: "GAMMA", key: "gamma", from: 0.1, to: 3.0, step: 0.05 },
+                            { label: "SLEW", key: "slew", from: 1, to: 25, step: 1 }
                         ]
 
                         Column {
@@ -508,7 +523,8 @@ PanelSectionHeader {
 
                             readonly property real currentValue: modelData.key === "gamma"
                                 ? root.curveGamma
-                                : (modelData.key === "dark" ? root.curveDark : root.curveLight)
+                                : (modelData.key === "slew" ? root.curveSlew
+                                : (modelData.key === "dark" ? root.curveDark : root.curveLight))
 
                             Row {
                                 width: parent.width

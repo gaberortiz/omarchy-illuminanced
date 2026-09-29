@@ -98,6 +98,23 @@ user-autobright.py --set dark=999   # error: dark (999) must be less than light 
 
 A rejected edit leaves both the file and the running daemon untouched.
 
+### Slew rate
+
+`slew` is the largest brightness change the daemon will make per poll, in
+percent. The default of 3 means a jump from 5% to 100% is walked up over about
+32 seconds instead of being written in one step, which is most of the difference
+between auto-brightness feeling smooth and feeling like the screen suddenly went
+dark or blinding.
+
+```sh
+user-autobright.py --set slew=1    # slow and gentle
+user-autobright.py --set slew=10   # quick
+```
+
+Lower it if you notice brightness creeping, raise it if you would rather it
+react fast (for example a room light switched on). The SLEW slider in the panel
+sets the same value.
+
 ## Troubleshooting
 
 The daemon holds brightness steady when the sensor stops reporting. A raw value
