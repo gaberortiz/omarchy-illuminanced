@@ -78,6 +78,26 @@ watch -n1 cat /sys/bus/iio/devices/iio:device0/in_illuminance_raw
 light feels too dim, lower gamma toward 0.4; if it is too bright, raise it
 toward 0.7.
 
+### Curve editor
+
+The bar panel has a collapsible **RESPONSE CURVE** section with sliders for
+`dark`, `light` and `gamma`, and a live plot of raw counts against target
+percent with the current reading marked. Dragging a slider updates the plot
+immediately; releasing it writes the config.
+
+Edits go through the daemon's own `--set` mode, which validates the whole file
+before writing and refuses anything that would leave an unusable curve, so a bad
+drag cannot wedge the daemon. The daemon notices the changed file on its next
+poll and applies it with no restart:
+
+```sh
+user-autobright.py --set gamma=0.5
+user-autobright.py --set dark=3 light=48 gamma=0.5
+user-autobright.py --set dark=999   # error: dark (999) must be less than light (48)
+```
+
+A rejected edit leaves both the file and the running daemon untouched.
+
 ## Troubleshooting
 
 The daemon holds brightness steady when the sensor stops reporting. A raw value

@@ -20,6 +20,18 @@ Panel {
     property bool brightnessAvailable: true
     property bool brightnessSetQueued: false
 
+    // Live calibration, mirrored from the daemon's config so the editor and the
+    // process actually applying the curve never disagree.
+    property int curveDark: 3
+    property int curveLight: 48
+    property real curveGamma: 0.5
+    property int curveMin: 5
+    property int curveMax: 100
+    property string curveSaveMsg: ""
+    property bool curveOpen: false
+    readonly property string daemonPath: Quickshell.env("HOME") + "/.local/bin/user-autobright.py"
+    readonly property int curveRange: Math.max(curveLight, 60)
+
     readonly property color hoverFill: bar ? Style.hoverFillFor(bar.foreground, Color.accent) : "transparent"
     readonly property color selectedFill: bar ? Style.selectedFillFor(bar.foreground, Color.accent) : "transparent"
 
@@ -71,7 +83,7 @@ Panel {
         return "auto " + (root.autoBrightnessEnabled ? "on" : "off")
     }
     function stateIpc() {
-        return JSON.stringify({ brightness: root.brightnessPercent, autoBrightness: root.autoBrightnessEnabled, sensor: root.sensorValue, serviceRunning: root.serviceRunning, w: root.implicitWidth, h: root.implicitHeight, inBar: root.bar !== null && root.bar !== undefined, slotW: root.parent ? Math.round(root.parent.width) : -1, slotH: root.parent ? Math.round(root.parent.height) : -1 })
+        return JSON.stringify({ brightness: root.brightnessPercent, autoBrightness: root.autoBrightnessEnabled, sensor: root.sensorValue, serviceRunning: root.serviceRunning, w: root.implicitWidth, h: root.implicitHeight, inBar: root.bar !== null && root.bar !== undefined, slotW: root.parent ? Math.round(root.parent.width) : -1, slotH: root.parent ? Math.round(root.parent.height) : -1, curve: { dark: root.curveDark, light: root.curveLight, gamma: root.curveGamma, min: root.curveMin, max: root.curveMax }, curveOpen: root.curveOpen, sensorMapped: root.curvePercent(root.sensorValue) })
     }
 
     IpcHandler {
@@ -143,6 +155,46 @@ Panel {
         root.sensorValue = s.sensor === undefined ? 0 : s.sensor
         root.autoBrightnessEnabled = s.auto === true
         root.serviceRunning = s.serviceRunning === true
+        if (s.curve) {
+            root.curveDark = s.curve.dark
+            root.curveLight = s.curve.light
+            root.curveGamma = s.curve.gamma
+            root.curveMin = s.curve.min
+            root.curveMax = s.curve.max
+        }
+    }
+
+    // Applied live while dragging so the plot tracks the slider, then written
+    // once on release. The daemon picks the file up on its next poll.
+    function previewCurve(key, value) {
+        if (key === "dark") root.curveDark = Math.round(value)
+        else if (key === "light") root.curveLight = Math.round(value)
+        else if (key === "gamma") root.curveGamma = Math.round(value * 100) / 100
+    }
+
+    // The daemon reads its config once at startup and used to need a restart to
+    // see an edit, so writes go through its own --set mode. It validates the
+    // whole file and refuses an unusable curve, which is why the panel never
+    // has to reason about whether dark < light before sending.
+    function writeCurve(key, value) {
+        curveProc.command = ["bash", "-c", root.daemonPath + " --set " + key + "=" + value + " 2>&1"]
+        curveProc.running = true
+    }
+
+    function saveCurve() {
+        writeCurve("dark", root.curveDark)
+        writeCurve("light", root.curveLight)
+        writeCurve("gamma", root.curveGamma)
+    }
+
+    // Same mapping as the daemon's interpolate_brightness, so the preview is
+    // the real curve rather than an approximation that drifts from it.
+    function curvePercent(raw) {
+        if (raw <= root.curveDark) return root.curveMin
+        if (raw >= root.curveLight) return root.curveMax
+        var ratio = (raw - root.curveDark) / (root.curveLight - root.curveDark)
+        if (root.curveGamma !== 1) ratio = Math.pow(ratio, root.curveGamma)
+        return Math.round(root.curveMin + ratio * (root.curveMax - root.curveMin))
     }
 
     Process { id: setBrightnessProc
@@ -158,6 +210,13 @@ Panel {
         stdout: StdioCollector { waitForEnd: true }
         stderr: StdioCollector { waitForEnd: true }
     }
+
+    Process { id: curveProc
+        stdout: StdioCollector { waitForEnd: true }
+        onExited: { root.curveSaveMsg = "Saved"; curveMsgTimer.restart() }
+    }
+
+    Timer { id: curveMsgTimer; interval: 1600; onTriggered: root.curveSaveMsg = "" }
 
     readonly property string barText: root.autoBrightnessEnabled ? "☀" + root.brightnessPercent + "%" : root.brightnessPercent + "%"
 
@@ -297,6 +356,195 @@ PanelSectionHeader {
                     spacing: Style.space(10)
                     PanelSectionHeader { text: "SENSOR"; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily }
                     Text { text: root.sensorValue + " lux (raw)"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; anchors.verticalCenter: parent.verticalCenter }
+                }
+            }
+
+            PanelSeparator { foreground: root.bar.foreground }
+
+            // Collapsible curve editor. The header is always visible so the
+            // panel does not open to a wall of sliders; everything below it is
+            // hidden until asked for.
+            Column {
+                id: curveSection
+                width: parent.width
+                spacing: Style.space(10)
+
+                Item {
+                    width: parent.width
+                    implicitHeight: Math.max(curveTitle.implicitHeight, curveChevron.implicitHeight)
+                    Rectangle {
+                        anchors.fill: parent
+                        anchors.margins: Style.space(-4)
+                        radius: Style.cornerRadius
+                        color: curveMouse.containsMouse ? root.selectedFill : "transparent"
+                    }
+                    PanelSectionHeader {
+                        id: curveTitle
+                        text: "RESPONSE CURVE"
+                        foreground: root.bar.foreground
+                        fontFamily: root.bar.fontFamily
+                        anchors.left: parent.left
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+                    Row {
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        spacing: Style.space(6)
+                        Text {
+                            text: root.curveSaveMsg
+                            visible: text !== ""
+                            color: Qt.darker(root.bar.foreground, 1.4)
+                            font.family: root.bar.fontFamily
+                            font.pixelSize: Style.font.caption
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+                        Text {
+                            id: curveChevron
+                            text: ">"
+                            color: root.bar.foreground
+                            font.family: root.bar.fontFamily
+                            font.pixelSize: Style.font.subtitle
+                            font.bold: true
+                            rotation: root.curveOpen ? 90 : 0
+                            Behavior on rotation { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
+                        }
+                    }
+                    MouseArea {
+                        id: curveMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        onClicked: root.curveOpen = !root.curveOpen
+                    }
+                }
+
+                Column {
+                    width: parent.width
+                    spacing: Style.space(12)
+                    visible: root.curveOpen
+                    height: visible ? implicitHeight : 0
+
+                    // Live plot of raw sensor counts against target percent,
+                    // with the current reading marked, so a slider drag shows
+                    // the effect before it is saved.
+                    Canvas {
+                        id: curvePlot
+                        width: parent.width
+                        height: Style.space(120)
+
+                        onPaint: {
+                            var ctx = getContext("2d")
+                            ctx.reset()
+                            ctx.fillStyle = Qt.darker(root.bar.background, 1.2)
+                            ctx.fillRect(0, 0, width, height)
+
+                            var span = root.curveRange
+                            var toX = function(v) { return (v / span) * width }
+                            var toY = function(p) { return height - (p / 100) * height }
+
+                            ctx.strokeStyle = Qt.darker(root.bar.foreground, 1.9)
+                            ctx.lineWidth = 1
+                            ctx.beginPath()
+                            ctx.moveTo(0, toY(0)); ctx.lineTo(width, toY(0))
+                            ctx.moveTo(0, toY(100)); ctx.lineTo(width, toY(100))
+                            ctx.stroke()
+
+                            ctx.strokeStyle = Color.accent
+                            ctx.lineWidth = 2
+                            ctx.beginPath()
+                            var started = false
+                            for (var raw = 0; raw <= span; raw += 1) {
+                                var px = toX(raw)
+                                var py = toY(root.curvePercent(raw))
+                                if (!started) { ctx.moveTo(px, py); started = true }
+                                else ctx.lineTo(px, py)
+                            }
+                            ctx.stroke()
+
+                            var mx = toX(root.sensorValue)
+                            if (root.sensorValue <= span) {
+                                ctx.strokeStyle = root.bar.foreground
+                                ctx.lineWidth = 1
+                                ctx.beginPath()
+                                ctx.moveTo(mx, 0); ctx.lineTo(mx, height)
+                                ctx.stroke()
+                                ctx.fillStyle = root.bar.foreground
+                                ctx.beginPath()
+                                ctx.arc(mx, toY(root.curvePercent(root.sensorValue)), 3, 0, Math.PI * 2)
+                                ctx.fill()
+                            }
+                        }
+                        // Repaint when anything the curve depends on moves.
+                        Connections {
+                            target: root
+                            function onCurveDarkChanged() { curvePlot.requestPaint() }
+                            function onCurveLightChanged() { curvePlot.requestPaint() }
+                            function onCurveGammaChanged() { curvePlot.requestPaint() }
+                            function onCurveMinChanged() { curvePlot.requestPaint() }
+                            function onCurveMaxChanged() { curvePlot.requestPaint() }
+                            function onSensorValueChanged() { curvePlot.requestPaint() }
+                        }
+                    }
+
+                    Text {
+                        width: parent.width
+                        text: "now: raw " + root.sensorValue + " -> " + root.curvePercent(root.sensorValue) + "%"
+                        color: Qt.darker(root.bar.foreground, 1.3)
+                        font.family: root.bar.fontFamily
+                        font.pixelSize: Style.font.caption
+                    }
+
+                    Repeater {
+                        model: [
+                            { label: "DARK", key: "dark", from: 0, to: Math.max(1, root.curveLight - 1), step: 1 },
+                            { label: "LIGHT", key: "light", from: Math.min(root.curveLight + 1, 999), to: 999, step: 1 },
+                            { label: "GAMMA", key: "gamma", from: 0.1, to: 3.0, step: 0.05 }
+                        ]
+
+                        Column {
+                            id: curveRow
+                            required property var modelData
+                            width: curveSection.width
+                            spacing: Style.space(4)
+
+                            readonly property real currentValue: modelData.key === "gamma"
+                                ? root.curveGamma
+                                : (modelData.key === "dark" ? root.curveDark : root.curveLight)
+
+                            Row {
+                                width: parent.width
+                                spacing: Style.space(10)
+                                PanelSectionHeader {
+                                    text: curveRow.modelData.label
+                                    foreground: root.bar.foreground
+                                    fontFamily: root.bar.fontFamily
+                                }
+                                Text {
+                                    text: curveRow.modelData.key === "gamma"
+                                        ? Number(curveRow.currentValue).toFixed(2)
+                                        : String(Math.round(curveRow.currentValue))
+                                    color: root.bar.foreground
+                                    font.family: root.bar.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                            }
+
+                            Slider {
+                                id: curveSlider
+                                width: parent.width
+                                from: curveRow.modelData.from
+                                to: curveRow.modelData.to
+                                stepSize: curveRow.modelData.step
+                                value: curveRow.currentValue
+                                live: true
+                                onValueChanged: if (pressed) root.previewCurve(curveRow.modelData.key, value)
+                                onPressedChanged: if (!pressed) root.saveCurve()
+                                background: Rectangle { implicitHeight: Style.space(4); radius: Style.space(2); color: Qt.darker(root.bar.background, 1.2) }
+                                contentItem: Rectangle { implicitHeight: Style.space(4); radius: Style.space(2); color: Color.accent; width: curveSlider.visualPosition * parent.width }
+                                handle: Rectangle { width: Style.space(12); height: Style.space(12); radius: Style.space(6); color: root.bar.foreground; x: curveSlider.visualPosition * (parent.width - width); y: (parent.height - height) / 2 }
+                            }
+                        }
+                    }
                 }
             }
         }

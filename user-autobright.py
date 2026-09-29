@@ -59,23 +59,23 @@ def load_config():
 
     if dark >= light:
         logging.error("Invalid config: dark threshold (%d) must be less than light threshold (%d)", dark, light)
-        sys.exit(1)
+        return None
 
     if not 0 <= min_bri <= 100 or not 0 <= max_bri <= 100:
         logging.error("Invalid config: brightness must be between 0 and 100")
-        sys.exit(1)
+        return None
 
     if min_bri >= max_bri:
         logging.error("Invalid config: min brightness (%d) must be less than max brightness (%d)", min_bri, max_bri)
-        sys.exit(1)
+        return None
 
     if interval < 1:
         logging.error("Invalid config: poll interval (%d) must be at least 1 second", interval)
-        sys.exit(1)
+        return None
 
     if debounce < 1:
         logging.error("Invalid config: debounce (%d) must be at least 1", debounce)
-        sys.exit(1)
+        return None
 
     if not 0.05 <= gamma <= 5.0:
         logging.error("Invalid config: gamma (%s) must be between 0.05 and 5.0", gamma)
@@ -152,6 +152,17 @@ def status_path():
 
 
 _last_status = None
+# The panel's curve editor seeds its sliders from here, so the widget and the
+# daemon can never disagree about the active calibration.
+_curve = {"dark": 0, "light": 0, "gamma": 1.0, "min": 0, "max": 100}
+
+
+def publish_curve(dark, light, min_bri, max_bri, gamma):
+    _curve["dark"] = dark
+    _curve["light"] = light
+    _curve["min"] = min_bri
+    _curve["max"] = max_bri
+    _curve["gamma"] = gamma
 
 
 def write_status(brightness_percent, sensor_raw, state, service_running):
@@ -166,9 +177,10 @@ def write_status(brightness_percent, sensor_raw, state, service_running):
         "sensor": sensor_raw,
         "auto": state == "auto",
         "serviceRunning": service_running,
+        "curve": dict(_curve),
         "updated": time.time(),
     }
-    comparable = {k: payload[k] for k in ("brightness", "sensor", "auto", "serviceRunning")}
+    comparable = {k: payload[k] for k in ("brightness", "sensor", "auto", "serviceRunning", "curve")}
     if comparable == _last_status:
         return
     try:
@@ -191,6 +203,73 @@ def interpolate_brightness(raw, dark, light, min_bri, max_bri, gamma=1.0):
         # are: 1.0 is linear, 0.5 is roughly perceptual.
         ratio = ratio ** gamma
     return round(min_bri + ratio * (max_bri - min_bri))
+
+
+def set_config_values(assignments):
+    """Update named config values in place and validate the result.
+
+    The panel calls this from the curve editor. Doing it here rather than with
+    sed from QML keeps the write atomic and refuses edits that would leave an
+    unusable curve, so a bad slider drag cannot wedge the daemon.
+    """
+    allowed = {
+        "dark": ("thresholds", "dark", int),
+        "light": ("thresholds", "light", int),
+        "min": ("brightness", "min", int),
+        "max": ("brightness", "max", int),
+        "gamma": ("brightness", "gamma", float),
+        "interval": ("polling", "interval", int),
+        "debounce": ("polling", "debounce", int),
+    }
+
+    config = configparser.ConfigParser()
+    if os.path.isfile(CONFIG_PATH):
+        config.read(CONFIG_PATH)
+
+    for item in assignments:
+        if "=" not in item:
+            return f"error: expected key=value, got {item!r}"
+        key, raw = item.split("=", 1)
+        key = key.strip()
+        if key not in allowed:
+            return f"error: unknown key {key!r}"
+        section, option, caster = allowed[key]
+        try:
+            value = caster(raw.strip())
+        except ValueError:
+            return f"error: {key} is not a number: {raw!r}"
+        if not config.has_section(section):
+            config.add_section(section)
+        config.set(section, option, str(value))
+
+    # Validate the whole file as it would be read back, so an edit that leaves
+    # the curve unusable is refused instead of applied and rejected later.
+    effective = {
+        "dark": config.getint("thresholds", "dark", fallback=DEFAULTS["dark"]),
+        "light": config.getint("thresholds", "light", fallback=DEFAULTS["light"]),
+        "min": config.getint("brightness", "min", fallback=DEFAULTS["min_brightness"]),
+        "max": config.getint("brightness", "max", fallback=DEFAULTS["max_brightness"]),
+        "gamma": config.getfloat("brightness", "gamma", fallback=DEFAULTS["gamma"]),
+        "interval": config.getint("polling", "interval", fallback=DEFAULTS["interval"]),
+        "debounce": config.getint("polling", "debounce", fallback=DEFAULTS["debounce"]),
+    }
+    if effective["dark"] >= effective["light"]:
+        return f"error: dark ({effective['dark']}) must be less than light ({effective['light']})"
+    if effective["min"] >= effective["max"]:
+        return f"error: min ({effective['min']}) must be less than max ({effective['max']})"
+    if not 0.05 <= effective["gamma"] <= 5.0:
+        return f"error: gamma ({effective['gamma']}) must be between 0.05 and 5.0"
+    if effective["interval"] < 1:
+        return "error: interval must be at least 1"
+
+    tmp = CONFIG_PATH + ".tmp"
+    try:
+        with open(tmp, "w") as handle:
+            config.write(handle)
+        os.replace(tmp, CONFIG_PATH)
+    except OSError as e:
+        return f"error: could not write config: {e}"
+    return None
 
 
 def main():
@@ -229,6 +308,38 @@ def main():
     change_threshold = 3
     last_raw = 0
 
+    def reload_config():
+        # The panel edits this file from the GUI, so pick changes up within one
+        # poll rather than needing a service restart. A rejected config leaves
+        # the running one in place rather than taking the daemon down.
+        nonlocal dark, light, min_bri, max_bri, gamma, interval, debounce
+        nonlocal sensor_override, backlight_device
+        try:
+            stamp = os.path.getmtime(CONFIG_PATH)
+        except OSError:
+            return False
+        if stamp == reload_config.stamp:
+            return False
+        reload_config.stamp = stamp
+        values = load_config()
+        if values is None:
+            logging.error("Config rejected, keeping previous settings")
+            return False
+        if reload_config.values is not None and values[:7] == reload_config.values[:7]:
+            return False
+        logging.info("Config changed, applying without restart")
+        (dark, light, min_bri, max_bri, gamma, interval, debounce,
+         sensor_override, backlight_device) = values
+        reload_config.values = values
+        return True
+
+    reload_config.stamp = None
+    reload_config.values = None
+    try:
+        reload_config.stamp = os.path.getmtime(CONFIG_PATH)
+    except OSError:
+        pass
+
     def publish():
         actual = get_current_brightness(backlight_device)
         write_status(
@@ -242,6 +353,9 @@ def main():
     manual_override_file = Path("/tmp/user-autobright-manual")
 
     while running:
+        reload_config()
+        publish_curve(dark, light, min_bri, max_bri, gamma)
+
         # Check if manual override is active
         if manual_override_file.exists():
             if state != "manual":
@@ -343,4 +457,11 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--set":
+        error = set_config_values(sys.argv[2:])
+        if error:
+            print(error, file=sys.stderr)
+            sys.exit(1)
+        print("ok")
+        sys.exit(0)
     main()
