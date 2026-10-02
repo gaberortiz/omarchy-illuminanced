@@ -173,6 +173,7 @@ Panel {
     function previewCurve(key, value) {
         if (key === "dark") root.curveDark = Math.round(value)
         else if (key === "light") root.curveLight = Math.round(value)
+        else if (key === "min") root.curveMin = Math.round(value)
         else if (key === "gamma") root.curveGamma = Math.round(value * 100) / 100
         else if (key === "slew") root.curveSlew = Math.round(value)
     }
@@ -181,7 +182,7 @@ Panel {
     // see an edit, so writes go through its own --set mode. It validates the
     // whole file and refuses an unusable curve, which is why the panel never
     // has to reason about whether dark < light before sending.
-    // All four values go out in one call. Reassigning curveProc.command per key
+    // All five values go out in one call. Reassigning curveProc.command per key
     // meant only the last write survived, and a drag that crossed two sliders
     // could persist a half-updated curve; --set validates the whole set before
     // replacing the file, so one command is also one atomic write.
@@ -189,6 +190,7 @@ Panel {
         var args = " --set"
             + " dark=" + root.curveDark
             + " light=" + root.curveLight
+            + " min=" + root.curveMin
             + " gamma=" + root.curveGamma
             + " slew=" + root.curveSlew
         curveProc.command = ["bash", "-c", root.daemonPath + args + " 2>&1"]
@@ -511,6 +513,7 @@ PanelSectionHeader {
                         model: [
                             { label: "DARK", key: "dark", from: 0, to: Math.max(1, root.curveLight - 1), step: 1 },
                             { label: "LIGHT", key: "light", from: Math.min(root.curveLight + 1, 999), to: 999, step: 1 },
+                            { label: "MIN", key: "min", from: 0, to: Math.max(1, root.curveMax - 1), step: 1 },
                             { label: "GAMMA", key: "gamma", from: 0.1, to: 3.0, step: 0.05 },
                             { label: "SLEW", key: "slew", from: 1, to: 25, step: 1 }
                         ]
@@ -524,7 +527,8 @@ PanelSectionHeader {
                             readonly property real currentValue: modelData.key === "gamma"
                                 ? root.curveGamma
                                 : (modelData.key === "slew" ? root.curveSlew
-                                : (modelData.key === "dark" ? root.curveDark : root.curveLight))
+                                : (modelData.key === "dark" ? root.curveDark
+                                : (modelData.key === "min" ? root.curveMin : root.curveLight)))
 
                             Row {
                                 width: parent.width

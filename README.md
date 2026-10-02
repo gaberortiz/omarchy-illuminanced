@@ -78,10 +78,23 @@ watch -n1 cat /sys/bus/iio/devices/iio:device0/in_illuminance_raw
 light feels too dim, lower gamma toward 0.4; if it is too bright, raise it
 toward 0.7.
 
+`[brightness] min` is the floor: the brightness the screen holds once the room
+is dark enough to sit at or below `dark`. It sets only where the bottom of the
+curve lands, not how fast brightness climbs afterwards. Raise it if a dark room
+leaves the screen too dim to read comfortably, lower it for a darker floor.
+
+```sh
+user-autobright.py --set min=15
+```
+
+The default of 5 is dim on most panels. The MIN slider in the panel sets the
+same value, and is capped one below `max` because the daemon rejects a curve
+where `min >= max`.
+
 ### Curve editor
 
 The bar panel has a collapsible **RESPONSE CURVE** section with sliders for
-`dark`, `light` and `gamma`, and a live plot of raw counts against target
+`dark`, `light`, `min` and `gamma`, and a live plot of raw counts against target
 percent with the current reading marked. Dragging a slider updates the plot
 immediately; releasing it writes the config.
 
